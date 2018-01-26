@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 import os
-from keras.applications.vgg16 import VGG16
+from keras.applications.vgg16 import VGG16, preprocess_input
 from keras.preprocessing.image import ImageDataGenerator
 from keras.models import Sequential, Model
 from keras.layers import Input, Activation, Dropout, Flatten, Dense
@@ -7,18 +8,32 @@ from keras.preprocessing.image import ImageDataGenerator
 from keras import optimizers
 import numpy as np
 from smallcnn import save_history
-
+from keras.initializers import he_normal, glorot_normal
+import subprocess
+import keras
+import argparse
+from tensorflow.python.lib.io import file_io
 # https://gist.github.com/fchollet/7eb39b44eb9e16e59632d25fb3119975
 
-img_width, img_height = 150, 150
-train_data_dir = 'data/train'
-validation_data_dir = 'data/validation'
+img_width, img_height = 60, 60
 nb_train_samples = 2000
 nb_validation_samples = 800
 nb_epoch = 50
-result_dir = 'results'
+batch_size=64
+result_dir = '/tmp'
+MODEL = 'dor_or_cat.hdf5'
 
-if __name__ == '__main__':
+def go_main(job_dir, gs_download):
+    if job_dir.startswith('gs://') or gs_download == 'True':
+        cmd = 'gsutil -m cp -r gs://kceproject-1113-ml/cat_dog/data.tar.gz /tmp'
+        subprocess.check_call(cmd.split())
+        cmd = 'tar -zxvf /tmp/data.tar.gz -C /tmp'
+        subprocess.check_call(cmd.split())
+        train_data_dir = '/tmp/data/train'
+        validation_data_dir = '/tmp/data/validation'
+    else:
+        train_data_dir = '/home/jiman/cat_dog/data/train'
+        validation_data_dir = '/home/jiman/cat_dog/data/validation'
     # VGG16モデルと学習済み重みをロード
     # Fully-connected層（FC）はいらないのでinclude_top=False）
     # input_tensorを指定しておかないとoutput_shapeがNoneになってエラーになるので注意
@@ -31,13 +46,14 @@ if __name__ == '__main__':
     # Flattenへの入力指定はバッチ数を除く
     top_model = Sequential()
     top_model.add(Flatten(input_shape=vgg16_model.output_shape[1:]))
-    top_model.add(Dense(256, activation='relu'))
+    top_model.add(Dropout(0.2))
+    top_model.add(Dense(256, activation='relu', kernel_initializer=he_normal()))
     top_model.add(Dropout(0.5))
-    top_model.add(Dense(1, activation='sigmoid'))
+    top_model.add(Dense(1, activation='sigmoid', kernel_initializer=glorot_normal()))
 
     # 学習済みのFC層の重みをロード
     # TODO: ランダムな重みでどうなるか試す
-    top_model.load_weights(os.path.join(result_dir, 'bottleneck_fc_model.h5'))
+    #top_model.load_weights(os.path.join(result_dir, 'bottleneck_fc_model.h5'))
 
     # vgg16_modelはkeras.engine.training.Model
     # top_modelはSequentialとなっている
@@ -59,7 +75,7 @@ if __name__ == '__main__':
         print(i, model.layers[i])
 
     # 最後のconv層の直前までの層をfreeze
-    for layer in model.layers[:15]:
+    for layer in model.layers[:18]:
         layer.trainable = False
 
     # Total params: 16,812,353
@@ -70,36 +86,78 @@ if __name__ == '__main__':
     # TODO: ここでAdamを使うとうまくいかない
     # Fine-tuningのときは学習率を小さくしたSGDの方がよい？
     model.compile(loss='binary_crossentropy',
-                  optimizer=optimizers.SGD(lr=1e-4, momentum=0.9),
+                  #optimizer=optimizers.SGD(lr=1e-4, momentum=0.9),
+                  optimizer=optimizers.Adam(lr=1e-3),
                   metrics=['accuracy'])
 
     train_datagen = ImageDataGenerator(
-        rescale=1.0 / 255,
-        shear_range=0.2,
-        zoom_range=0.2,
+        #rescale=1.0 / 255,
+        #shear_range=0.2,
+        #zoom_range=0.2,
+        preprocessing_function=preprocess_input,
         horizontal_flip=True)
 
-    test_datagen = ImageDataGenerator(rescale=1.0 / 255)
+    #test_datagen = ImageDataGenerator(rescale=1.0 / 255)
+    test_datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
 
     train_generator = train_datagen.flow_from_directory(
         train_data_dir,
         target_size=(img_height, img_width),
-        batch_size=32,
+        batch_size=batch_size,
         class_mode='binary')
 
     validation_generator = test_datagen.flow_from_directory(
         validation_data_dir,
         target_size=(img_height, img_width),
-        batch_size=32,
+        batch_size=batch_size,
         class_mode='binary')
 
+    tblog = keras.callbacks.TensorBoard(
+        log_dir=os.path.join(job_dir, 'logs'),
+        histogram_freq=0,
+        write_graph=True,
+        embeddings_freq=0)
+
+    callbacks = [tblog]
+
     # Fine-tuning
+    train_steps = int(nb_train_samples/batch_size)+1
+    val_steps = int(nb_validation_samples/batch_size)+1
     history = model.fit_generator(
         train_generator,
-        samples_per_epoch=nb_train_samples,
-        nb_epoch=nb_epoch,
+        steps_per_epoch=train_steps,
+        epochs=nb_epoch,
         validation_data=validation_generator,
-        nb_val_samples=nb_validation_samples)
+        validation_steps=val_steps,
+        callbacks=callbacks)
 
-    model.save_weights(os.path.join(result_dir, 'finetuning.h5'))
-    save_history(history, os.path.join(result_dir, 'history_finetuning.txt'))
+    #model.save_weights(os.path.join(result_dir, 'finetuning.h5'))
+    #save_history(history, os.path.join(result_dir, 'history_finetuning.txt'))
+
+    if job_dir.startswith("gs://"):
+        model.save(MODEL)
+        copy_file_to_gcs(job_dir, MODEL)
+    else:
+        model.save(os.path.join(job_dir, MODEL))
+
+
+def copy_file_to_gcs(job_dir, file_path):
+    with file_io.FileIO(file_path, mode='r') as input_f:
+        with file_io.FileIO(os.path.join(job_dir, file_path), mode='w+') \
+                as output_f:
+            output_f.write(input_f.read())
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--job-dir',
+                        required=True,
+                        type=str,
+                        help='GCS or local dir to write checkpoints and '
+                        'export model')
+    parser.add_argument('--gs-download',
+                        type=str,
+                        help='GCS download or not',
+                        )
+    parse_args, unknown = parser.parse_known_args()
+    go_main(**parse_args.__dict__)

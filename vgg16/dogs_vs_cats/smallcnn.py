@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 from keras.models import Sequential
 from keras.layers import Convolution2D, MaxPooling2D
